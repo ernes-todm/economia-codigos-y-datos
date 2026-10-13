@@ -1,0 +1,631 @@
+---
+title: " Estimaciones VAR SVAR´s: Impacto de Choques de la FED en el IMOR""
+subtitle: "Incluyendo Volatilidad GARCH y Miedo a Flotar"
+output: html_notebook
+---
+
+### 1. Configuración del Entorno y Paqueterías
+
+```{r setup, message=FALSE, warning=FALSE}
+#install.packages(c("vars", "urca", "tseries", "readxl", "ggplot2", "rugarch"))
+library(vars)
+library(urca)
+#install.packages("tseries")
+library(tseries)
+#install.packages("readxl")
+library(readxl)
+#install.packages("rugarch")
+library(rugarch)
+library(tseries)
+library(vars)
+library(dplyr) # Para el %>% y manipulación de datos
+library(zoo)   # Para la interpolación na.locf()
+
+#Importar base de datos sucia
+library(readxl)
+ruta <-("C:/Users/E21021/Desktop/EDM/imor/BSVAR_IMOR.xlsx")
+#ruta <- read_excel("C:/Users/E21021/Desktop/EDM/imor/BSVAR_IMOR.xlsx")
+head(ruta)
+
+
+# 1. Cargar Base Mensual (Macro)
+base_mensual <- read_excel(ruta)
+base_mensual$y_imor <- as.numeric(base_mensual$y_imor)
+base_mensual$fecha <- as.Date(base_mensual$fecha)
+
+# Limpieza de base maestra
+base_mensual <- subset(base_mensual, !is.na(fecha))
+base_mensual$z1_vix <- NULL
+base_mensual$z2_embimex <- NULL
+base_mensual$z3_cembimex <- NULL
+
+# 2. Cargar Series Diarias (Financieras)
+embi_cembi <- clean_names(read_excel(ruta, sheet = "embi_cembi"))
+vix <- clean_names(read_excel(ruta, sheet = "vix_bmblh"))
+fix <- clean_names(read_excel(ruta, sheet = "fix_diario"))
+
+# Estandarización de la primera columna como "fecha"
+colnames(embi_cembi)[1] <- "fecha"; embi_cembi$fecha <- as.Date(embi_cembi$fecha)
+colnames(vix)[1] <- "fecha";        vix$fecha <- as.Date(vix$fecha)
+colnames(fix)[1] <- "fecha";        fix$fecha <- as.Date(fix$fecha)
+
+colnames(fix)[2] <- "fix"
+colnames(vix)[2] <- "vix"
+
+# 3. Dataframe Diario Preservado (Con LOCF para imputar feriados)
+df_diario <- merge(merge(embi_cembi, vix, by = "fecha", all = TRUE), fix, by = "fecha", all = TRUE) %>%
+  arrange(fecha) %>%
+  mutate(across(c(vix, embi_mex, cembi_mex, fix), ~ na.locf(., na.rm = FALSE)))
+
+# 4. Colapso a Frecuencia Mensual (End-of-Month)
+datos_mensuales_financieros <- df_diario %>%
+  mutate(anio_mes = format(fecha, "%Y-%m")) %>%
+  group_by(anio_mes) %>%
+  filter(fecha == max(fecha)) %>%
+  ungroup() %>%
+  transmute(
+    fecha = as.Date(paste0(anio_mes, "-01")),
+    z1_vix = vix,
+    z2_embimex = embi_mex,
+    z3_cembimex = cembi_mex,
+    fix_mensual = fix
+)
+
+# 3. Cargar la Volatilidad GARCH(1,1) desde Clean_data
+#ruta_garch <- "C:/Users/52465/OneDrive/Desktop/Seminario de Investigación Económica/Clean_data/volatilidad_garch.csv"
+#vol_garch <- read.csv(ruta_garch)
+#vol_garch$fecha <- as.Date(vol_garch$fecha)
+  
+
+
+# 3. Estimación de la Volatilidad GARCH(1,1) "Al vuelo" (Sin usar CSV)
+library(rugarch)
+
+# a) Calculamos los rendimientos diarios del FIX
+fix_garch <- fix %>%
+  arrange(fecha) %>%
+  na.omit() %>%
+  mutate(rendimiento = c(NA, diff(log(fix)))) %>%
+  na.omit()
+
+# b) Especificamos la arquitectura del modelo GARCH(1,1)
+especificacion <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+# c) Estimamos el modelo
+ajuste_garch <- ugarchfit(spec = especificacion, data = fix_garch$rendimiento)
+
+# d) Extraemos la volatilidad diaria
+fix_garch$vol_diaria <- sigma(ajuste_garch)
+
+# e) Colapsamos a frecuencia mensual (último dato hábil del mes)
+vol_garch_mensual <- fix_garch %>%
+  mutate(anio_mes = format(fecha, "%Y-%m")) %>%
+  group_by(anio_mes) %>%
+  filter(fecha == max(fecha)) %>%
+  ungroup() %>%
+  transmute(
+    fecha = as.Date(paste0(anio_mes, "-01")), 
+    v_fix_garch = vol_diaria * 100 # Multiplicamos por 100 para puntos porcentuales
+  )
+
+# 4. Ensamble Final
+base_integrada <- merge(base_mensual, datos_financieros_mensuales, by = "fecha", all.x = TRUE)
+base_integrada <- merge(base_integrada, vol_garch_mensual, by = "fecha", all.x = TRUE)
+
+# Verificamos que todo se unió correctamente
+head(base_integrada)
+```
+
+
+```{r Data}
+# ==============================================================================
+# FASE 1: CARGA DE DATOS Y COLAPSO DE SERIES DIARIAS
+# ==============================================================================
+# (Solo corre install.packages en la consola si no las tienes, aquí las comentamos)
+# install.packages("dplyr")
+# install.packages("zoo")
+
+library(readxl)
+library(dplyr)
+library(zoo)
+
+# Definimos la ruta principal
+ruta <- "C:/Users/E21021/Downloads/BSVAR_IMOR.xlsx"
+
+# 1. Cargar Base Mensual (Macro)
+base_mensual <- read_excel(ruta)
+base_mensual$y_imor <- as.numeric(base_mensual$y_imor)
+base_mensual$fecha <- as.Date(base_mensual$fecha)
+
+# Eliminamos filas fantasma de Excel y borramos las columnas vacías
+base_mensual <- subset(base_mensual, !is.na(fecha))
+base_mensual$z1_vix <- NULL
+base_mensual$z2_embimex <- NULL
+base_mensual$z3_cembimex <- NULL
+
+# 2. Cargar Series Diarias (Financieras)
+embi_cembi <- read_excel(ruta, sheet = "embi_cembi")
+vix <- read_excel(ruta, sheet = "vix_bmblh")
+fix <- read_excel(ruta, sheet = "fix_diario")
+
+# EL TRUCO: Bautizamos todas las columnas explícitamente para que R las encuentre en minúsculas
+colnames(embi_cembi) <- c("fecha", "embi_mex", "cembi_mex")
+embi_cembi$fecha <- as.Date(embi_cembi$fecha)
+
+colnames(vix) <- c("fecha", "vix")
+vix$fecha <- as.Date(vix$fecha)
+
+colnames(fix) <- c("fecha", "fix")
+fix$fecha <- as.Date(fix$fecha)
+
+# Fusión y colapso al último dato hábil del mes (LOCF)
+datos_financieros_mensuales <- merge(merge(embi_cembi, vix, by="fecha", all=TRUE), fix, by="fecha", all=TRUE) %>%
+  arrange(fecha) %>%
+  # Ahora R encontrará 'embi_mex' y 'cembi_mex' sin problemas
+  mutate(across(c(vix, embi_mex, cembi_mex, fix), ~ na.locf(., na.rm = FALSE))) %>%
+  mutate(anio_mes = format(fecha, "%Y-%m")) %>%
+  group_by(anio_mes) %>%
+  filter(fecha == max(fecha)) %>%
+  ungroup() %>%
+  transmute(
+    fecha = as.Date(paste0(anio_mes, "-01")), 
+    z1_vix = vix,
+    z2_embimex = embi_mex,
+    z3_cembimex = cembi_mex,
+    fix_mensual = fix
+  )da, vol_garch, by = "fecha", all.x = TRUE)
+```
+*************************************************
+* CON EL CSV DE LAS VARIABLES YA FINALES PARA EL MODELO DESCARGADO, CORRER ESTSE CÓDIGO)
+
+
+*modelo 3.1*
+```{r}
+# ==============================================================================
+#BSVAR 12 VARIABLES Y TABLA DE PUBLICACIÓN
+# ==============================================================================
+# install.packages(c("BVAR", "dplyr")) # Descomenta si es la primera vez en este equipo
+#unlink("D:/SISTEMAFINANCIERO/R/R-4.5.2/library/00LOCK", recursive = TRUE)
+#install.packages("BVAR")
+library(BVAR)
+library(dplyr)
+
+# ------------------------------------------------------------------------------
+# 1. CARGA DE DATOS Y PREPARACIÓN DE LA MATRIZ
+# ------------------------------------------------------------------------------
+# Corrección: Usamos read.csv() porque el archivo es un .csv
+ruta_csv <- "C:/Users/E21021/Desktop/EDM/imor/base_var_definitiva.csv"
+base_var <- read.csv(ruta_csv, stringsAsFactors = FALSE)
+
+vars_m3.1 <- c("d_x1_shadowrate", "d_l_sp500", "d_l_indpro", "d_l_wtc", 
+               "d_z1_vix", "z2_embimex", "v_fix_garch", "d_l_igae", 
+               "d_l_inpc", "d_d2_nup", "d_y_imor")
+
+# Aseguramos el cruce exacto de columnas y el formato de matriz numérica
+Y_matrix <- base_var %>%
+  select(all_of(intersect(vars_m3.1, colnames(base_var)))) %>%
+  mutate(across(everything(), ~ as.numeric(.x))) %>%
+  na.omit() %>%
+  as.matrix()
+
+cat("\n--- MATRIZ CARGADA: Obs =", nrow(Y_matrix), "| Vars =", ncol(Y_matrix), "---\n")
+
+# ------------------------------------------------------------------------------
+# 2. PRIORES DE MINNESOTA Y ESTIMACIÓN MCMC
+# ------------------------------------------------------------------------------
+mn_prior <- bv_minnesota(lambda = bv_lambda(mode = 0.1, sd = 0.2), 
+                         alpha = bv_alpha(mode = 2))
+priors_m3.1 <- bv_priors(hyper = "auto", mn = mn_prior)
+
+set.seed(123)
+modelo3.1_bvar <- bvar(Y_matrix, 
+                       lags = 1, 
+                       n_draw = 10000, 
+                       n_burn = 2000, 
+                       priors = priors_m3.1)
+
+# ------------------------------------------------------------------------------
+# 3. IDENTIFICACIÓN ESTRUCTURAL (Añadiendo BVAR:: para evitar conflictos)
+# ------------------------------------------------------------------------------
+n_vars <- ncol(Y_matrix)
+
+crear_matriz_signos <- function(signo_tasa, signo_bolsa, n) {
+  restr <- matrix(NA, nrow = n, ncol = n)
+  restr[1, 1] <- signo_tasa   
+  restr[2, 1] <- signo_bolsa  
+  return(restr)
+}
+
+matriz_pura <- crear_matriz_signos(1, -1, n_vars)
+# Usamos BVAR:: explícitamente para que no pelee con el paquete vars
+irf_pura_m3.1 <- BVAR::irf(modelo3.1_bvar, horizon = 36, sign_restr = matriz_pura)
+
+matriz_info <- crear_matriz_signos(1, 1, n_vars)
+irf_info_m3.1 <- BVAR::irf(modelo3.1_bvar, horizon = 36, sign_restr = matriz_info)
+
+# ------------------------------------------------------------------------------
+# 5. DESCOMPOSICIÓN DE VARIANZA (FEVD) AL 68%
+# ------------------------------------------------------------------------------
+# Blindamos el FEVD con BVAR::
+fevd_m3.1 <- BVAR::fevd(modelo3.1_bvar, horizon = 36)
+pos_imor <- match("d_y_imor", colnames(Y_matrix))
+
+tabla_fevd_m3.1 <- data.frame(
+  Variable = colnames(Y_matrix),
+  Mes_6    = as.numeric(round(colMeans(fevd_m3.1$fevd[, , 6, pos_imor]) * 100, 2)),
+  Mes_12   = as.numeric(round(colMeans(fevd_m3.1$fevd[, , 12, pos_imor]) * 100, 2)),
+  Mes_24   = as.numeric(round(colMeans(fevd_m3.1$fevd[, , 24, pos_imor]) * 100, 2))
+) %>% arrange(desc(Mes_24))
+
+cat("\n--- TABLA FEVD: CONTRIBUCIÓN A LA VARIANZA DEL IMOR ---\n")
+print(knitr::kable(tabla_fevd_m3.1))
+
+# ------------------------------------------------------------------------------
+# 6. TABLA DE PUBLICACIÓN (BSVAR MODELO 3.1)
+# ------------------------------------------------------------------------------
+idx_horizontes <- c(1, 2, 4, 7, 13, 19, 25, 37) 
+nombres_h <- c("H=0", "H=1", "H=3", "H=6", "H=12", "H=18", "H=24", "H=36")
+
+vars_tabla <- c("d_x1_shadowrate", "d_l_sp500", "d_l_igae", "d_l_inpc", "d_y_imor")
+nombres_display <- c("Shadow Rate", "S&P 500", "IGAE", "INPC", "IMOR")
+
+formatear_celda <- function(mediana, lower, upper) {
+  significativo <- (lower * upper) > 0 
+  estrellas <- ifelse(significativo, "**", "***")
+  sprintf("%.4f%s \n [%.4f, %.4f]", mediana, estrellas, lower, upper)
+}
+
+# 1. Asignamos el nombre único y ordenado para el Modelo 3.1
+tabla_publicacion_bsvar3.1 <- data.frame(Variable = nombres_display, stringsAsFactors = FALSE)
+for(h_nom in nombres_h) {
+  tabla_publicacion_bsvar3.1[[h_nom]] <- NA
+}
+
+idx_impulse <- match("d_x1_shadowrate", colnames(Y_matrix))
+
+# 2. Función extractora universal (Se mantiene igual)
+extraer_irf <- function(quants_array, cuantil, horizonte, resp, imp) {
+  dims <- dim(quants_array)
+  d_quant <- which(dims == 3)[1]           
+  d_horiz <- which(dims > 12)[1]           
+  d_vars  <- which(dims == ncol(Y_matrix)) 
+  
+  h_seguro <- min(horizonte, dims[d_horiz])
+  
+  coords <- numeric(4)
+  coords[d_quant] <- cuantil
+  coords[d_horiz] <- h_seguro
+  coords[d_vars[1]] <- resp
+  coords[d_vars[2]] <- imp
+  
+  return(quants_array[matrix(coords, nrow = 1)])
+}
+
+# 3. Llenado dinámico referenciando la nueva tabla
+for(i in seq_along(vars_tabla)) {
+  idx_response <- match(vars_tabla[i], colnames(Y_matrix))
+  
+  for(j in seq_along(idx_horizontes)) {
+    h_idx <- idx_horizontes[j]
+    
+    lower_val  <- extraer_irf(irf_pura_m3.1$quants, 1, h_idx, idx_response, idx_impulse)
+    median_val <- extraer_irf(irf_pura_m3.1$quants, 2, h_idx, idx_response, idx_impulse)
+    upper_val  <- extraer_irf(irf_pura_m3.1$quants, 3, h_idx, idx_response, idx_impulse)
+    
+    # Guardamos en nuestro objeto específico
+    tabla_publicacion_bsvar3.1[i, j + 1] <- formatear_celda(median_val, lower_val, upper_val)
+  }
+}
+
+cat("\n--- TABLA DE PUBLICACIÓN: IMPACTO ESTRUCTURAL (MODELO 3.1) ---\n")
+print(tabla_publicacion_bsvar3.1)
+View(tabla_publicacion_bsvar3.1)
+
+# ==============================================================================
+# 7. TABLA DE PUBLICACIÓN: CHOQUE DE INFORMACIÓN (GOOD NEWS)
+# ==============================================================================
+# Inicializamos el objeto para el Choque de Información
+tabla_publicacion_info3.1 <- data.frame(Variable = nombres_display, stringsAsFactors = FALSE)
+for(h_nom in nombres_h) {
+  tabla_publicacion_info3.1[[h_nom]] <- NA
+}
+
+# Llenado dinámico referenciando irf_info_m3.1
+for(i in seq_along(vars_tabla)) {
+  idx_response <- match(vars_tabla[i], colnames(Y_matrix))
+  
+  for(j in seq_along(idx_horizontes)) {
+    h_idx <- idx_horizontes[j]
+    
+    # CRÍTICO: Extraemos de la IRF de Información
+    lower_val  <- extraer_irf(irf_info_m3.1$quants, 1, h_idx, idx_response, idx_impulse)
+    median_val <- extraer_irf(irf_info_m3.1$quants, 2, h_idx, idx_response, idx_impulse)
+    upper_val  <- extraer_irf(irf_info_m3.1$quants, 3, h_idx, idx_response, idx_impulse)
+    
+    tabla_publicacion_info3.1[i, j + 1] <- formatear_celda(median_val, lower_val, upper_val)
+  }
+}
+
+cat("\n--- TABLA DE PUBLICACIÓN: CHOQUE DE INFORMACIÓN (MODELO 3.1) ---\n")
+print(tabla_publicacion_info3.1)
+View(tabla_publicacion_info3.1)
+```
+
+*3.1 COMPLETO CON LAS 50000 INTERACCIONES*
+
+
+```{r}
+# ==============================================================================
+# SCRIPT MAESTRO DEFINITIVO: BSVAR 3.1 (50,000 ITERACIONES Y EXOGENEIDAD ESTRICTA)
+# ==============================================================================
+library(BVAR)
+library(dplyr)
+
+# ------------------------------------------------------------------------------
+# 1. CARGA DE DATOS Y PREPARACIÓN DE LA MATRIZ
+# ------------------------------------------------------------------------------
+ruta_csv <- "C:/Users/E21021/Desktop/EDM/imor/base_var_definitiva.csv"
+base_var <- read.csv(ruta_csv, stringsAsFactors = FALSE)
+
+# Definición de las 12 variables (Orden: Bloque Externo -> Bloque Interno)
+vars_m3.1 <- c("d_x1_shadowrate", "d_l_sp500", "d_l_indpro", "d_l_wtc", 
+               "d_z1_vix", "z2_embimex", "v_fix_garch", "d_l_igae", 
+               "d_l_inpc", "d_d2_nup", "d_y_imor")
+
+Y_matrix <- base_var %>%
+  select(all_of(intersect(vars_m3.1, colnames(base_var)))) %>%
+  mutate(across(everything(), ~ as.numeric(.x))) %>%
+  na.omit() %>%
+  as.matrix()
+
+cat("\n--- MATRIZ CARGADA: Obs =", nrow(Y_matrix), "| Vars =", ncol(Y_matrix), "---\n")
+
+# ------------------------------------------------------------------------------
+# 2. PRIORES DE MINNESOTA Y ESTIMACIÓN (MCMC DEFINITIVO DE PUBLICACIÓN)
+# ------------------------------------------------------------------------------
+# Candado matemático para forzar lambda ~ 0.1 y garantizar exogeneidad
+mn_prior <- bv_minnesota(
+  lambda = bv_lambda(mode = 0.1, sd = 0.01, min = 0.099, max = 0.101), 
+  alpha  = bv_alpha(mode = 2)
+)
+priors_m3.1 <- bv_priors(hyper = "auto", mn = mn_prior)
+
+set.seed(123)
+# Estimación pesada con 50,000 iteraciones y 10,000 de descarte (Burn-in)
+modelo3.1_bvar <- bvar(Y_matrix, 
+                       lags = 1, 
+                       n_draw = 50000, 
+                       n_burn = 10000, 
+                       priors = priors_m3.1)
+
+# ------------------------------------------------------------------------------
+# 3. IDENTIFICACIÓN ESTRUCTURAL (RESTRICCIONES DE SIGNO AL HORIZONTE 36)
+# ------------------------------------------------------------------------------
+n_vars <- ncol(Y_matrix)
+
+crear_matriz_signos <- function(signo_tasa, signo_bolsa, n) {
+  restr <- matrix(NA, nrow = n, ncol = n)
+  restr[1, 1] <- signo_tasa   
+  restr[2, 1] <- signo_bolsa  
+  return(restr)
+}
+
+# A. Choque Monetario Puro: Tasa (+) y Bolsa (-)
+matriz_pura <- crear_matriz_signos(1, -1, n_vars)
+irf_pura_m3.1 <- BVAR::irf(modelo3.1_bvar, horizon = 36, sign_restr = matriz_pura)
+
+# B. Choque de Información: Tasa (+) y Bolsa (+)
+matriz_info <- crear_matriz_signos(1, 1, n_vars)
+irf_info_m3.1 <- BVAR::irf(modelo3.1_bvar, horizon = 36, sign_restr = matriz_info)
+
+# ------------------------------------------------------------------------------
+# 4. CONFIGURACIÓN DEL EXTRACTOR UNIVERSAL Y FORMATO DE TABLAS
+# ------------------------------------------------------------------------------
+idx_horizontes <- c(1, 2, 4, 7, 13, 19, 25, 37) 
+nombres_h <- c("H=0", "H=1", "H=3", "H=6", "H=12", "H=18", "H=24", "H=36")
+
+vars_tabla <- c("d_x1_shadowrate", "d_l_sp500", "d_l_igae", "d_l_inpc", "d_y_imor")
+nombres_display <- c("Shadow Rate", "S&P 500", "IGAE", "INPC", "IMOR")
+
+formatear_celda <- function(mediana, lower, upper) {
+  significativo <- (lower * upper) > 0 
+  estrellas <- ifelse(significativo, "**", "***")
+  sprintf("%.4f%s \n [%.4f, %.4f]", mediana, estrellas, lower, upper)
+}
+
+extraer_irf <- function(quants_array, cuantil, horizonte, resp, imp) {
+  dims <- dim(quants_array)
+  d_quant <- which(dims == 3)[1]           
+  d_horiz <- which(dims > 12)[1]           
+  d_vars  <- which(dims == ncol(Y_matrix)) 
+  
+  h_seguro <- min(horizonte, dims[d_horiz])
+  
+  coords <- numeric(4)
+  coords[d_quant] <- cuantil
+  coords[d_horiz] <- h_seguro
+  coords[d_vars[1]] <- resp
+  coords[d_vars[2]] <- imp
+  
+  return(quants_array[matrix(coords, nrow = 1)])
+}
+
+idx_impulse <- match("d_x1_shadowrate", colnames(Y_matrix))
+
+# ------------------------------------------------------------------------------
+# 5. GENERACIÓN: TABLA CHOQUE MONETARIO PURO
+# ------------------------------------------------------------------------------
+tabla_publicacion_bsvar3.1 <- data.frame(Variable = nombres_display, stringsAsFactors = FALSE)
+for(h_nom in nombres_h) { tabla_publicacion_bsvar3.1[[h_nom]] <- NA }
+
+for(i in seq_along(vars_tabla)) {
+  idx_response <- match(vars_tabla[i], colnames(Y_matrix))
+  
+  for(j in seq_along(idx_horizontes)) {
+    h_idx <- idx_horizontes[j]
+    
+    lower_val  <- extraer_irf(irf_pura_m3.1$quants, 1, h_idx, idx_response, idx_impulse)
+    median_val <- extraer_irf(irf_pura_m3.1$quants, 2, h_idx, idx_response, idx_impulse)
+    upper_val  <- extraer_irf(irf_pura_m3.1$quants, 3, h_idx, idx_response, idx_impulse)
+    
+    tabla_publicacion_bsvar3.1[i, j + 1] <- formatear_celda(median_val, lower_val, upper_val)
+  }
+}
+
+cat("\n--- TABLA DE PUBLICACIÓN: IMPACTO ESTRUCTURAL (MODELO 3.1) ---\n")
+print(tabla_publicacion_bsvar3.1)
+View(tabla_publicacion_bsvar3.1)
+
+# ------------------------------------------------------------------------------
+# 6. GENERACIÓN: TABLA CHOQUE DE INFORMACIÓN (GOOD NEWS)
+# ------------------------------------------------------------------------------
+tabla_publicacion_info3.1 <- data.frame(Variable = nombres_display, stringsAsFactors = FALSE)
+for(h_nom in nombres_h) { tabla_publicacion_info3.1[[h_nom]] <- NA }
+
+for(i in seq_along(vars_tabla)) {
+  idx_response <- match(vars_tabla[i], colnames(Y_matrix))
+  
+  for(j in seq_along(idx_horizontes)) {
+    h_idx <- idx_horizontes[j]
+    
+    lower_val  <- extraer_irf(irf_info_m3.1$quants, 1, h_idx, idx_response, idx_impulse)
+    median_val <- extraer_irf(irf_info_m3.1$quants, 2, h_idx, idx_response, idx_impulse)
+    upper_val  <- extraer_irf(irf_info_m3.1$quants, 3, h_idx, idx_response, idx_impulse)
+    
+    tabla_publicacion_info3.1[i, j + 1] <- formatear_celda(median_val, lower_val, upper_val)
+  }
+}
+
+cat("\n--- TABLA DE PUBLICACIÓN: CHOQUE DE INFORMACIÓN (MODELO 3.1) ---\n")
+print(tabla_publicacion_info3.1)
+View(tabla_publicacion_info3.1)
+```
+
+*****************************
+*3.2 bsvar con restricción de signos, exogeneidad de bloque, incorporando el vix en el choque de información y monetario*
+
+```{r}
+# ==============================================================================
+# MODELO 3.2: BSVAR CON VIX (BRUNO & SHIN) Y TABLAS DE PUBLICACIÓN
+# ==============================================================================
+library(BVAR)
+library(dplyr)
+
+# 1. Estimación Bayesiana Modelo 3.2 (MCMC 50,000 con Lambda Anclado)
+mn_prior_3.2 <- bv_minnesota(
+  lambda = bv_lambda(mode = 0.1, sd = 0.01, min = 0.099, max = 0.101), 
+  alpha  = bv_alpha(mode = 2)
+)
+priors_m3.2 <- bv_priors(hyper = "auto", mn = mn_prior_3.2)
+
+set.seed(123)
+modelo3.2_bvar <- bvar(Y_matrix, 
+                       lags = 1, 
+                       n_draw = 50000, 
+                       n_burn = 10000, 
+                       priors = priors_m3.2)
+
+# 2. Identificación Estructural con Triple Restricción (Tasa, S&P 500 y VIX)
+n_vars <- ncol(Y_matrix)
+
+crear_matriz_signos_vix <- function(signo_tasa, signo_bolsa, signo_vix, n) {
+  restr <- matrix(NA, nrow = n, ncol = n)
+  restr[1, 1] <- signo_tasa   # Shadow Rate (+)
+  restr[2, 1] <- signo_bolsa  # S&P 500 (+ / -)
+  restr[5, 1] <- signo_vix    # VIX (Fila 5 en vars_m3.1)
+  return(restr)
+}
+
+# A. Choque Monetario Puro: Tasa (+), Bolsa (-), VIX (+) [Aversión al riesgo]
+matriz_pura_vix <- crear_matriz_signos_vix(1, -1, 1, n_vars)
+irf_pura_m3.2 <- BVAR::irf(modelo3.2_bvar, horizon = 36, sign_restr = matriz_pura_vix)
+
+# B. Choque de Información: Tasa (+), Bolsa (+), VIX (-) [Optimismo global]
+matriz_info_vix <- crear_matriz_signos_vix(1, 1, -1, n_vars)
+irf_info_m3.2 <- BVAR::irf(modelo3.2_bvar, horizon = 36, sign_restr = matriz_info_vix)
+
+# 3. Gráficas de Impulso-Respuesta: Paneles con las 4 Variables Clave de México
+vars_mexico <- c("d_l_igae", "d_l_inpc", "d_l_fix", "d_y_imor")
+nombres_mexico <- c("Actividad Real (IGAE)", "Inflación (INPC)", "Tipo de Cambio (FIX)", "Morosidad Bancaria (IMOR)")
+
+# --- PANEL A: CHOQUE MONETARIO PURO (MODELO 3.2) ---
+par(mfrow = c(2, 2), mar = c(3, 3, 3, 1))
+for(k in seq_along(vars_mexico)) {
+  plot(irf_pura_m3.2, vars_impulse = "d_x1_shadowrate", vars_response = vars_mexico[k], 
+       col = "#8B0000", lwd = 2, main = nombres_mexico[k])
+  abline(h = 0, lty = 2, col = "black")
+}
+mtext("Modelo 3.2: Choque Monetario Puro (con VIX)", outer = TRUE, line = -1.5, font = 2)
+
+# --- PANEL B: CHOQUE DE INFORMACIÓN (MODELO 3.2) ---
+par(mfrow = c(2, 2), mar = c(3, 3, 3, 1))
+for(k in seq_along(vars_mexico)) {
+  plot(irf_info_m3.2, vars_impulse = "d_x1_shadowrate", vars_response = vars_mexico[k], 
+       col = "#2E8B57", lwd = 2, main = nombres_mexico[k])
+  abline(h = 0, lty = 2, col = "black")
+}
+mtext("Modelo 3.2: Choque de Información (con VIX)", outer = TRUE, line = -1.5, font = 2)
+
+par(mfrow = c(1, 1)) # Restablecer ventana gráfica
+
+# 4. TABLAS DE PUBLICACIÓN CON NOMENCLATURA ESTRICTA (_bsvar3.2 y _info3.2)
+idx_horizontes <- c(1, 2, 4, 7, 13, 19, 25, 37) 
+nombres_h <- c("H=0", "H=1", "H=3", "H=6", "H=12", "H=18", "H=24", "H=36")
+
+vars_tabla <- c("d_x1_shadowrate", "d_l_sp500", "d_l_igae", "d_l_inpc", "d_y_imor")
+nombres_display <- c("Shadow Rate", "S&P 500", "IGAE", "INPC", "IMOR")
+
+formatear_celda <- function(mediana, lower, upper) {
+  significativo <- (lower * upper) > 0 
+  estrellas <- ifelse(significativo, "**", "***")
+  sprintf("%.4f%s \n [%.4f, %.4f]", mediana, estrellas, lower, upper)
+}
+
+idx_impulse <- match("d_x1_shadowrate", colnames(Y_matrix))
+
+# --- A. TABLA CHOQUE MONETARIO PURO (MODELO 3.2) ---
+tabla_publicacion_bsvar3.2 <- data.frame(Variable = nombres_display, stringsAsFactors = FALSE)
+for(h_nom in nombres_h) { tabla_publicacion_bsvar3.2[[h_nom]] <- NA }
+
+for(i in seq_along(vars_tabla)) {
+  idx_response <- match(vars_tabla[i], colnames(Y_matrix))
+  for(j in seq_along(idx_horizontes)) {
+    h_idx <- idx_horizontes[j]
+    lower_val  <- extraer_irf(irf_pura_m3.2$quants, 1, h_idx, idx_response, idx_impulse)
+    median_val <- extraer_irf(irf_pura_m3.2$quants, 2, h_idx, idx_response, idx_impulse)
+    upper_val  <- extraer_irf(irf_pura_m3.2$quants, 3, h_idx, idx_response, idx_impulse)
+    tabla_publicacion_bsvar3.2[i, j + 1] <- formatear_celda(median_val, lower_val, upper_val)
+  }
+}
+
+cat("\n--- TABLA DE PUBLICACIÓN: IMPACTO ESTRUCTURAL (MODELO 3.2) ---\n")
+print(tabla_publicacion_bsvar3.2)
+View(tabla_publicacion_bsvar3.2)
+
+# --- B. TABLA CHOQUE DE INFORMACIÓN (MODELO 3.2) ---
+tabla_publicacion_info3.2 <- data.frame(Variable = nombres_display, stringsAsFactors = FALSE)
+for(h_nom in nombres_h) { tabla_publicacion_info3.2[[h_nom]] <- NA }
+
+for(i in seq_along(vars_tabla)) {
+  idx_response <- match(vars_tabla[i], colnames(Y_matrix))
+  for(j in seq_along(idx_horizontes)) {
+    h_idx <- idx_horizontes[j]
+    lower_val  <- extraer_irf(irf_info_m3.2$quants, 1, h_idx, idx_response, idx_impulse)
+    median_val <- extraer_irf(irf_info_m3.2$quants, 2, h_idx, idx_response, idx_impulse)
+    upper_val  <- extraer_irf(irf_info_m3.2$quants, 3, h_idx, idx_response, idx_impulse)
+    tabla_publicacion_info3.2[i, j + 1] <- formatear_celda(median_val, lower_val, upper_val)
+  }
+}
+
+cat("\n--- TABLA DE PUBLICACIÓN: CHOQUE DE INFORMACIÓN (MODELO 3.2) ---\n")
+print(tabla_publicacion_info3.2)
+View(tabla_publicacion_bsvar3.2)
+```
+
+
+
+
